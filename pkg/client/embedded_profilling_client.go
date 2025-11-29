@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"runtime/pprof"
 	"sync"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/process"
 
 	"github.com/King-kin5/analysis/pkg/types"
 	"go.uber.org/zap"
@@ -18,13 +21,13 @@ import (
 
 // Client is the embedded profiling client
 type Client struct {
-	config     types.AgentConfig
-	logger     *zap.Logger
+	config    types.AgentConfig
+	logger    *zap.Logger
 	httpClient *http.Client
-	sessions   map[string]*profilingSession
-	mu         sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
+	sessions  map[string]*profilingSession
+	mu        sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 type profilingSession struct {
@@ -37,9 +40,9 @@ type profilingSession struct {
 // NewClient creates a new embedded profiling client
 func NewClient(config types.AgentConfig) (*Client, error) {
 	logger, _ := zap.NewProduction()
-
+	
 	ctx, cancel := context.WithCancel(context.Background())
-
+	
 	client := &Client{
 		config: config,
 		logger: logger,
@@ -61,7 +64,7 @@ func NewClient(config types.AgentConfig) (*Client, error) {
 // StartProfiling starts a new profiling session
 func (c *Client) StartProfiling(ctx context.Context, config types.ProfilingConfig) (string, error) {
 	sessionID := fmt.Sprintf("%s_%d", c.config.ApplicationID, time.Now().UnixNano())
-
+	
 	session := types.ProfileSession{
 		ID:            sessionID,
 		ApplicationID: c.config.ApplicationID,
@@ -146,7 +149,7 @@ func (c *Client) StopProfiling(sessionID string) error {
 func (c *Client) startCPUProfile(ctx context.Context, ps *profilingSession) error {
 	var buf bytes.Buffer
 	ps.cpuFile = nopCloser{&buf}
-
+	
 	if err := pprof.StartCPUProfile(ps.cpuFile); err != nil {
 		return err
 	}
@@ -157,7 +160,7 @@ func (c *Client) startCPUProfile(ctx context.Context, ps *profilingSession) erro
 	go func() {
 		<-sessionCtx.Done()
 		pprof.StopCPUProfile()
-
+		
 		// Send CPU profile data
 		profileData := types.ProfileData{
 			SessionID:   ps.session.ID,
@@ -204,10 +207,23 @@ func (c *Client) collectMemoryProfile(ctx context.Context, ps *profilingSession,
 }
 
 func (c *Client) collectIOProfile(ctx context.Context, ps *profilingSession, config types.ProfilingConfig) {
-	// I/O profiling implementation - would track file operations, network I/O, etc.
-	// This is a placeholder for I/O monitoring
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
+	// Get current process
+	pid := int32(runtime.GOMAXPROCS(0)) // This is a placeholder
+	proc, err := process.NewProcess(pid)
+	if err != nil {
+		// If we can't get process, try to get current process ID
+		proc, err = process.NewProcess(int32(os.Getpid()))
+		if err != nil {
+			c.logger.Error("Failed to get process for I/O profiling", zap.Error(err))
+			return
+		}
+	}
+
+	// Track previous I/O stats for delta calculation
+	var prevReadBytes, prevWriteBytes uint64
 
 	for {
 		select {
@@ -217,7 +233,48 @@ func (c *Client) collectIOProfile(ctx context.Context, ps *profilingSession, con
 			if !ps.collecting {
 				return
 			}
-			// Collect I/O metrics and send
+
+			// Collect I/O statistics
+			ioCounters, err := proc.IOCounters()
+			if err != nil {
+				c.logger.Error("Failed to collect I/O stats", zap.Error(err))
+				continue
+			}
+
+			// Calculate deltas
+			readDelta := ioCounters.ReadBytes - prevReadBytes
+			writeDelta := ioCounters.WriteBytes - prevWriteBytes
+
+			prevReadBytes = ioCounters.ReadBytes
+			prevWriteBytes = ioCounters.WriteBytes
+
+			// Create I/O profile data
+			ioData := map[string]interface{}{
+				"timestamp":       time.Now(),
+				"read_bytes":      ioCounters.ReadBytes,
+				"write_bytes":     ioCounters.WriteBytes,
+				"read_count":      ioCounters.ReadCount,
+				"write_count":     ioCounters.WriteCount,
+				"read_delta":      readDelta,
+				"write_delta":     writeDelta,
+			}
+
+			jsonData, err := json.Marshal(ioData)
+			if err != nil {
+				c.logger.Error("Failed to marshal I/O data", zap.Error(err))
+				continue
+			}
+
+			profileData := types.ProfileData{
+				SessionID:   ps.session.ID,
+				Type:        types.ProfileTypeIO,
+				Timestamp:   time.Now(),
+				Data:        jsonData,
+				Metadata:    ioData,
+				SampleCount: 1,
+			}
+
+			c.sendProfileData(profileData)
 		}
 	}
 }
@@ -321,7 +378,7 @@ func (c *Client) autoProfile() {
 				CollectMetrics:  true,
 				MetricsInterval: 5 * time.Second,
 			}
-
+			
 			sessionID, err := c.StartProfiling(c.ctx, config)
 			if err != nil {
 				c.logger.Error("Auto-profiling failed", zap.Error(err))
@@ -335,7 +392,7 @@ func (c *Client) autoProfile() {
 // Close stops the client and cleans up resources
 func (c *Client) Close() error {
 	c.cancel()
-
+	
 	c.mu.Lock()
 	for sessionID := range c.sessions {
 		c.StopProfiling(sessionID)
